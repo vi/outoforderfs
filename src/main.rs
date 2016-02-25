@@ -17,6 +17,9 @@ use std::time::Duration;
 use nix::sys::signal;
 
 use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::io::{Write,Read,Seek,SeekFrom};
+use std::cell::RefCell;
 
 type BlockIndex = u64;
 
@@ -26,20 +29,76 @@ struct DelayedWriteback {
     block_index : BlockIndex,
 }
 
-type BlockCache = std::collections::BTreeMap<BlockIndex, Vec<u64>>;
+type BlockCache = std::collections::BTreeMap<BlockIndex, Vec<u8>>;
 type Queue = std::collections::BinaryHeap<DelayedWriteback>;
 
-struct State {
+#[derive(Default)]
+struct CacheState {
     cache: BlockCache,
     queue: Queue,
-    attention_of_writeback_thread: Condvar,
 }
 
-impl Default for State { fn default() -> Self { State {
-        cache: Default::default(),
-        queue: Default::default(),
-        attention_of_writeback_thread: Condvar::new(), // https://github.com/rust-lang/rust/issues/31865
+struct WritebackThread {
+    s : Mutex<CacheState>,
+    attention: Condvar,
+}
+
+impl Default for WritebackThread { fn default() -> Self { WritebackThread {
+        s: Mutex::new(Default::default()),
+        attention: Condvar::new(), // https://github.com/rust-lang/rust/issues/31865
     } } }
+    
+impl WritebackThread {
+    fn run<W>(&self, mut file: W, blocksize: u64) where W : Write + Seek  {
+        
+        let mut writeback : Option<(SeekFrom, Vec<u8>)>;
+        
+        writeback = None;
+        loop {
+            if let Some((seekpos, data)) = writeback {
+                file.seek(seekpos).expect("seek failed");
+                file.write(data.as_ref()).expect("write failed");
+                writeback = None;
+            }
+            
+            let mut g = self.s.lock().unwrap();
+            
+            loop {
+                let timetowait : Option<Duration>;
+                
+                let needwriteback : bool;
+                if let Some(p) = g.queue.peek() {
+                    let now = Instant::now();
+                    
+                    if p.to_be_written_at <= now {
+                        needwriteback = true;
+                        timetowait = None; // actually should not be necessary
+                    } else {
+                        needwriteback = false;
+                        timetowait = Some(p.to_be_written_at.duration_from_earlier(now));
+                    }
+                } else {
+                    needwriteback = false;
+                    timetowait = None;
+                }
+                
+                if needwriteback {
+                    let p = g.queue.pop().unwrap();
+                    let data = g.cache.remove(&p.block_index).expect("inconsistency detected");
+                    writeback = Some((SeekFrom::Start(blocksize * p.block_index), data));
+                    break; // release lock and go to outer loop
+                } 
+            
+                if let Some(ttw) = timetowait {
+                    let (g2, _) = self.attention.wait_timeout(g, ttw).unwrap();
+                    g = g2;
+                } else {
+                    g = self.attention.wait(g).unwrap();
+                }
+            }
+        }
+    }
+}
 
 
 impl Ord for DelayedWriteback {
