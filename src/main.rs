@@ -6,6 +6,7 @@
 extern crate fuse;
 extern crate time;
 extern crate nix;
+extern crate rand;
 
 use std::env;
 use std::path::Path;
@@ -20,6 +21,7 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::sync::Arc;
 use std::io::{Write,Read,Seek,SeekFrom};
 use std::cell::RefCell;
+use rand::{Rng,thread_rng};
 
 type BlockIndex = u64;
 
@@ -41,11 +43,13 @@ struct CacheState {
 struct WritebackThread {
     s : Mutex<CacheState>,
     attention: Condvar,
+    writeback_completed: Condvar,
 }
 
 impl Default for WritebackThread { fn default() -> Self { WritebackThread {
         s: Mutex::new(Default::default()),
         attention: Condvar::new(), // https://github.com/rust-lang/rust/issues/31865
+        writeback_completed: Condvar::new(),
     } } }
     
 impl WritebackThread {
@@ -59,6 +63,7 @@ impl WritebackThread {
                 file.seek(seekpos).expect("seek failed");
                 file.write(data.as_ref()).expect("write failed");
                 writeback = None;
+                self.writeback_completed.notify_one();
             }
             
             let mut g = self.s.lock().unwrap();
@@ -97,6 +102,39 @@ impl WritebackThread {
                 }
             }
         }
+    }
+    
+    fn checkblock(&self, bi: BlockIndex) -> bool {
+        let mut g = self.s.lock().unwrap();
+        return g.cache.contains_key(&bi);
+    }
+    
+    fn useblock<F>(&self, bi: BlockIndex, closure: F) where F : FnOnce(Option<&Vec<u8>>) {
+        let mut g = self.s.lock().unwrap();
+        closure(g.cache.get(&bi));
+    }
+    
+    fn writeblock(&self, bi: BlockIndex, data: Vec<u8>, maxblocks: usize, maxdelay: Duration) {
+        let mut g = self.s.lock().unwrap();
+        if g.cache.contains_key(&bi) {
+            g.cache.insert(bi, data);
+            return;
+        }
+        while g.cache.len() >= maxblocks {
+            g = self.writeback_completed.wait(g).unwrap();
+        }
+        
+        g.cache.insert(bi, data);
+        
+        let max_nanos = maxdelay.as_secs() * 1000_000_000 + (maxdelay.subsec_nanos() as u64);
+        let r = thread_rng().gen_range(1, max_nanos);
+        let writeback_delay = Duration::new(r / 1000_000_000, (r % 1000_000_000) as u32);
+        
+        g.queue.push( DelayedWriteback {
+            to_be_written_at: Instant::now() + writeback_delay,
+            block_index : bi
+            });
+        self.attention.notify_all();
     }
 }
 

@@ -7,3 +7,4 @@ authors = ["Vitaly _Vi Shukela <vi0oss@gmail.com>"]
 fuse = "0.2"
 time = "0.1"
 nix = "0.4"
+rand = "0.3"
