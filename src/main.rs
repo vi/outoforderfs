@@ -1,5 +1,3 @@
-#![feature(time2)]
-
 #![allow(unused)]
 #![warn(unused_must_use)]
 
@@ -22,6 +20,7 @@ use std::sync::Arc;
 use std::io::{Write,Read,Seek,SeekFrom};
 use std::cell::RefCell;
 use rand::{Rng,thread_rng};
+use std::cell::Cell;
 
 type BlockIndex = u64;
 
@@ -44,21 +43,25 @@ struct WritebackThread {
     s : Mutex<CacheState>,
     attention: Condvar,
     writeback_completed: Condvar,
+    please_stop: Mutex<bool>,
 }
 
 impl Default for WritebackThread { fn default() -> Self { WritebackThread {
         s: Mutex::new(Default::default()),
         attention: Condvar::new(), // https://github.com/rust-lang/rust/issues/31865
         writeback_completed: Condvar::new(),
+        please_stop: Mutex::new(false),
     } } }
     
 impl WritebackThread {
-    fn run<W>(&self, mut file: W, blocksize: u64) where W : Write + Seek  {
+    fn new() -> WritebackThread { Default::default() }
+
+    fn run<W>(&self, mut file: &mut W, blocksize: u64) where W : Write + Seek  {
         
         let mut writeback : Option<(SeekFrom, Vec<u8>)>;
         
         writeback = None;
-        loop {
+        'outer: loop {
             if let Some((seekpos, data)) = writeback {
                 file.seek(seekpos).expect("seek failed");
                 file.write(data.as_ref()).expect("write failed");
@@ -68,7 +71,9 @@ impl WritebackThread {
             
             let mut g = self.s.lock().unwrap();
             
-            loop {
+           'inner: loop {
+                if *self.please_stop.lock().unwrap() { break 'outer; }
+                
                 let timetowait : Option<Duration>;
                 
                 let needwriteback : bool;
@@ -80,7 +85,7 @@ impl WritebackThread {
                         timetowait = None; // actually should not be necessary
                     } else {
                         needwriteback = false;
-                        timetowait = Some(p.to_be_written_at.duration_from_earlier(now));
+                        timetowait = Some(p.to_be_written_at.duration_since(now));
                     }
                 } else {
                     needwriteback = false;
@@ -114,7 +119,7 @@ impl WritebackThread {
         closure(g.cache.get(&bi));
     }
     
-    fn writeblock(&self, bi: BlockIndex, data: Vec<u8>, maxblocks: usize, maxdelay: Duration) {
+    fn writeblock(&self, bi: BlockIndex, data: Vec<u8>, maxblocks: usize, mindelay: Duration, maxdelay: Duration) {
         let mut g = self.s.lock().unwrap();
         if g.cache.contains_key(&bi) {
             g.cache.insert(bi, data);
@@ -126,14 +131,20 @@ impl WritebackThread {
         
         g.cache.insert(bi, data);
         
+        let min_nanos = mindelay.as_secs() * 1000_000_000 + (mindelay.subsec_nanos() as u64);
         let max_nanos = maxdelay.as_secs() * 1000_000_000 + (maxdelay.subsec_nanos() as u64);
-        let r = thread_rng().gen_range(1, max_nanos);
+        let r = thread_rng().gen_range(min_nanos, max_nanos+1);
         let writeback_delay = Duration::new(r / 1000_000_000, (r % 1000_000_000) as u32);
         
         g.queue.push( DelayedWriteback {
             to_be_written_at: Instant::now() + writeback_delay,
             block_index : bi
             });
+        self.attention.notify_all();
+    }
+    
+    fn stop(&self) {
+        *self.please_stop.lock().unwrap() = true;
         self.attention.notify_all();
     }
 }
@@ -154,6 +165,35 @@ impl PartialOrd for DelayedWriteback {
     fn partial_cmp(&self, other: &DelayedWriteback) -> Option<::std::cmp::Ordering> {
         Some(self.cmp(other))
     }
+}
+
+#[test]
+fn test_writeback_thread() {
+    use std::io::Cursor;
+    let mut v = Cursor::new(vec![0; 10]);
+    
+    let mut wt = Arc::new(WritebackThread::new());
+    
+    let waiter = {
+        let mut wt2 = wt.clone();
+        ::std::thread::spawn(move || {
+            wt2.run(&mut v, 2);
+            v
+        })
+    };
+    
+    wt.writeblock(3, vec![33,33], 10, Duration::from_secs(3), Duration::from_secs(4));
+    wt.writeblock(1, vec![5,1], 10, Duration::from_secs(1), Duration::from_secs(1));
+    wt.writeblock(4, vec![7,3], 10, Duration::from_secs(1), Duration::from_secs(1));
+    wt.writeblock(2, vec![2,1], 10, Duration::from_secs(1), Duration::from_secs(1));
+    wt.writeblock(0, vec![22,22], 10, Duration::from_secs(3), Duration::from_secs(4));
+    
+    ::std::thread::sleep(Duration::from_secs(2));
+    
+    wt.stop();
+    
+    let r = waiter.join().unwrap();
+    assert_eq!(r.get_ref(), &vec![0,0,5,1,2,1,0,0,7,3]);
 }
 
 
@@ -201,6 +241,8 @@ fn main () {
                                           signal::SockFlag::empty(),
                                           signal::SigSet::empty());
     unsafe { signal::sigaction(signal::SIGINT, &sig_action).unwrap(); }
+    
+    //let sf = 
     
     ::std::thread::sleep(Duration::from_secs(1));
 }
