@@ -22,6 +22,10 @@ use std::cell::Cell;
 
 type BlockIndex = u64;
 
+
+trait LikeFile : Read + Write + Seek {}
+impl<T> LikeFile for T where T : Read + Write + Seek {}
+
 #[derive(Eq,PartialEq)]
 struct DelayedWriteback {
     to_be_written_at : Instant,
@@ -37,30 +41,38 @@ struct CacheState {
     queue: Queue,
 }
 
-struct WritebackThread {
+struct WritebackThread<F : LikeFile> {
     s : Mutex<CacheState>,
     attention: Condvar,
     writeback_completed: Condvar,
     please_stop: Mutex<bool>,
+    f: Mutex<F>,
+    blocksize: u64,
+    
 }
 
-impl Default for WritebackThread { fn default() -> Self { WritebackThread {
-        s: Mutex::new(Default::default()),
-        attention: Condvar::new(), // https://github.com/rust-lang/rust/issues/31865
-        writeback_completed: Condvar::new(),
-        please_stop: Mutex::new(false),
-    } } }
+impl<F> WritebackThread<F> where F : LikeFile {
+    fn new(file: F, blocksize: u64) -> WritebackThread<F> { 
+        WritebackThread {
+            s: Mutex::new(Default::default()),
+            attention: Condvar::new(),
+            writeback_completed: Condvar::new(),
+            please_stop: Mutex::new(false),
+            f: Mutex::new(file),
+            blocksize: blocksize,
+        }
+    }
     
-impl WritebackThread {
-    fn new() -> WritebackThread { Default::default() }
-
-    fn run<W>(&self, mut file: &mut W, blocksize: u64) where W : Write + Seek  {
+    fn into_file(self) -> F { self.f.into_inner().unwrap() }
+    
+    fn run(&self) {
         
         let mut writeback : Option<(SeekFrom, Vec<u8>)>;
         
         writeback = None;
         'outer: loop {
             if let Some((seekpos, data)) = writeback {
+                let mut file = self.f.lock().unwrap();
                 file.seek(seekpos).expect("seek failed");
                 file.write(data.as_ref()).expect("write failed");
                 writeback = None;
@@ -93,7 +105,7 @@ impl WritebackThread {
                 if needwriteback {
                     let p = g.queue.pop().unwrap();
                     let data = g.cache.remove(&p.block_index).expect("inconsistency detected");
-                    writeback = Some((SeekFrom::Start(blocksize * p.block_index), data));
+                    writeback = Some((SeekFrom::Start(self.blocksize * p.block_index), data));
                     break 'inner; // release lock and go to outer loop
                 } 
             
@@ -112,7 +124,7 @@ impl WritebackThread {
         return g.cache.contains_key(&bi);
     }
     
-    fn useblock<F>(&self, bi: BlockIndex, closure: F) where F : FnOnce(Option<&Vec<u8>>) {
+    fn useblock<G>(&self, bi: BlockIndex, closure: G) where G: FnOnce(Option<&Vec<u8>>) {
         let mut g = self.s.lock().unwrap();
         closure(g.cache.get(&bi));
     }
@@ -173,13 +185,12 @@ fn test_writeback_thread() {
     use std::io::Cursor;
     let mut v = Cursor::new(vec![0; 10]);
     
-    let mut wt = Arc::new(WritebackThread::new());
+    let mut wt = Arc::new(WritebackThread::new(v, 2));
     
     let waiter = {
         let mut wt2 = wt.clone();
         ::std::thread::spawn(move || {
-            wt2.run(&mut v, 2);
-            v
+            wt2.run();
         })
     };
     
@@ -193,9 +204,11 @@ fn test_writeback_thread() {
     
     assert_eq!(wt.stop(), 2);
     
-    let r = waiter.join().unwrap();
-    assert_eq!(r.get_ref(), &vec![0,0,5,1,2,1,0,0,7,3]);
+    waiter.join().unwrap();
+    v = Arc::try_unwrap(wt).or_else(|_|Err("thread expected to finish already")).unwrap().into_file();
+    assert_eq!(v.get_ref(), &vec![0,0,5,1,2,1,0,0,7,3]);
 }
+
 ////////////////////////////////////////////////////
 
 const TTL: Timespec = Timespec { sec: 10, nsec: 0 };
@@ -203,12 +216,12 @@ const CREATE_TIME: Timespec = Timespec { sec: 1458180306, nsec: 0 }; //FIXME
 
 const HELLO_TXT_CONTENT: &'static str = "Hello World!\n";
 
-struct BunchOfTraitsAsFs<'a, F : Read + Write + Seek + 'a> {
+struct BunchOfTraitsAsFs<'a, F : LikeFile + 'a> {
     file: &'a mut F,
     fa: FileAttr,
 }
 
-impl<'a, F> BunchOfTraitsAsFs<'a, F> where F : Read + Write + Seek {
+impl<'a, F> BunchOfTraitsAsFs<'a, F> where F : LikeFile {
     fn new(f: &'a mut F, bs: u64) -> BunchOfTraitsAsFs<F> {
         let len = f.seek(SeekFrom::End(0)).expect("File not seekable");
         let blocks = ((len-1) / bs) + 1;
@@ -234,10 +247,9 @@ impl<'a, F> BunchOfTraitsAsFs<'a, F> where F : Read + Write + Seek {
         }
     }
 }
-
 const ENOENT : i32 = 2;
 
-impl<'a, F> Filesystem for BunchOfTraitsAsFs<'a, F>  where F : Read + Write + Seek {
+impl<'a, F> Filesystem for BunchOfTraitsAsFs<'a, F>  where F : LikeFile {
     fn lookup (&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
         reply.entry(&TTL, &self.fa, 0);
     }
@@ -318,15 +330,15 @@ fn main () {
     let maxblocks : u64 = maxblocks_s.to_str().unwrap().parse().unwrap();
                         
     
-    let mut wt = Arc::new(WritebackThread::new());
+    let mut wt = Arc::new(WritebackThread::new(source_file, blocksize));
+    let wt2 = wt.clone();
     
     use chan_signal::Signal;
     let signal = chan_signal::notify(&[Signal::INT, Signal::TERM]);
     
     let waiter = {
-        let mut wt2 = wt.clone();
         ::std::thread::spawn(move || {
-            wt2.run(&mut source_file, blocksize);
+            wt2.run();
         })
     };
     
