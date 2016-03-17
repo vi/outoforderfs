@@ -51,6 +51,14 @@ struct WritebackThread<F : LikeFile> {
     
 }
 
+struct VirtualFile<'a, F: LikeFile + 'a> {
+    cursor: u64,
+    maxdirtyblocks: u64,
+    mindelay: Duration,
+    maxdelay: Duration,
+    w: &'a WritebackThread<F>,
+}
+
 impl<F> WritebackThread<F> where F : LikeFile {
     fn new(file: F, blocksize: u64) -> WritebackThread<F> { 
         WritebackThread {
@@ -64,6 +72,16 @@ impl<F> WritebackThread<F> where F : LikeFile {
     }
     
     fn into_file(self) -> F { self.f.into_inner().unwrap() }
+    
+    fn get_virtual_file<'a>(&'a self, maxdirtyblocks: u64, mindelay: Duration, maxdelay: Duration) -> VirtualFile<'a, F> {
+        VirtualFile {
+            cursor: 0,
+            maxdirtyblocks: maxdirtyblocks,
+            mindelay: mindelay,
+            maxdelay: maxdelay,
+            w: self,
+        }
+    }
     
     fn run(&self) {
         
@@ -208,6 +226,88 @@ fn test_writeback_thread() {
     v = Arc::try_unwrap(wt).or_else(|_|Err("thread expected to finish already")).unwrap().into_file();
     assert_eq!(v.get_ref(), &vec![0,0,5,1,2,1,0,0,7,3]);
 }
+
+impl<'a, F> Read for VirtualFile<'a, F> where F : LikeFile + 'a {
+    fn read(&mut self, b: &mut [u8]) -> Result<usize,::std::io::Error> {
+        let mut file = self.w.f.lock().unwrap();
+        file.read(b)
+    }
+}
+
+impl<'a, F> Write for VirtualFile<'a, F> where F : LikeFile + 'a {
+    fn write(&mut self, b: &[u8]) -> Result<usize,::std::io::Error> {
+        let mut file = self.w.f.lock().unwrap();
+        file.write(b)
+    }
+    
+    fn flush(&mut self) -> Result<(), ::std::io::Error> {
+        Ok(())
+    }
+}
+
+impl<'a, F> Seek for VirtualFile<'a, F> where F : LikeFile + 'a {
+    fn seek(&mut self, s: ::std::io::SeekFrom) -> Result<u64,::std::io::Error> {
+        let mut file = self.w.f.lock().unwrap();
+        file.seek(s)
+    }
+}
+
+#[test]
+fn virtual_file_consistency() {
+    use std::io::Cursor;
+    let mut v = Cursor::new(vec![0; 10]);
+    
+    let mut wt = Arc::new(WritebackThread::new(v, 2));
+    
+    let waiter = {
+        let mut wt2 = wt.clone();
+        ::std::thread::spawn(move || {
+            wt2.run();
+        })
+    };
+    
+    let mut buf1 = [0; 1];
+    let mut buf2 = [0; 2];
+    let mut buf3 = [0; 3];
+    
+    let mut vf = wt.get_virtual_file(10, Duration::from_secs(0), Duration::from_secs(2));
+    assert_eq!(vf.write(&vec![4]  ).unwrap(), 1);
+    assert_eq!(vf.write(&vec![5,8]).unwrap(), 2);
+    assert_eq!(vf.write(&vec![1,3,9]).unwrap(), 3);
+    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+        assert_eq!(&[0,0,0], &buf3);
+    
+    assert_eq!(vf.seek(SeekFrom::Start(0)).unwrap(), 0);
+    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+        assert_eq!(&[4,5,8], &buf3);
+    assert_eq!(vf.read(&mut buf2).unwrap(), 2); 
+        assert_eq!(&[1,3], &buf2);
+    assert_eq!(vf.read(&mut buf1).unwrap(), 1); 
+        assert_eq!(&[9], &buf1);
+    
+    ::std::thread::sleep(Duration::from_secs(1));
+    
+    assert_eq!(vf.seek(SeekFrom::Start(0)).unwrap(), 0);
+    assert_eq!(vf.read(&mut buf2).unwrap(), 2); 
+        assert_eq!(&[4,5], &buf2);
+    assert_eq!(vf.read(&mut buf1).unwrap(), 1); 
+        assert_eq!(&[8], &buf1);
+    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+        assert_eq!(&[1,3,9], &buf3);
+        
+    ::std::thread::sleep(Duration::from_secs(2));
+    
+    assert_eq!(vf.seek(SeekFrom::Start(0)).unwrap(), 0);
+    assert_eq!(vf.read(&mut buf1).unwrap(), 1); 
+        assert_eq!(&[4], &buf1);
+    assert_eq!(vf.read(&mut buf2).unwrap(), 2); 
+        assert_eq!(&[5,8], &buf2);
+    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+        assert_eq!(&[1,3,9], &buf3);
+    
+    wt.stop();
+}
+
 
 ////////////////////////////////////////////////////
 
