@@ -416,14 +416,6 @@ fn main () {
                         .create(false)
                         .open(&source_file_s)
                         .expect("Can't open source file");
-    // FIXME :
-    let mut source_file_2 = ::std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .truncate(false)
-                        .create(false)
-                        .open(&source_file_s)
-                        .expect("Can't open source file");
                         
     let blocksize : u64 = blocksize_s.to_str().unwrap().parse().unwrap();
     let maxtime   : u64 = maxtime_s.to_str().unwrap().parse().unwrap();
@@ -442,7 +434,9 @@ fn main () {
         })
     };
     
-    let fs = BunchOfTraitsAsFs::new(&mut source_file_2, blocksize);
+    let mut vf = wt.get_virtual_file(maxblocks, Duration::from_millis(0), Duration::from_millis(maxtime));
+    
+    let fs = BunchOfTraitsAsFs::new(&mut vf, blocksize);
     let guard = unsafe { fuse::spawn_mount(fs, &mountpoint_file_s, &[]) };
     
     signal.recv().unwrap();
