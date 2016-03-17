@@ -3,17 +3,15 @@
 
 extern crate fuse;
 extern crate time;
-extern crate nix;
 extern crate rand;
+extern crate chan_signal;
 
 use std::env;
 use std::path::Path;
 use time::Timespec;
-use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyDirectory};
+use fuse::{FileType, FileAttr, Filesystem, Request, ReplyData, ReplyEntry, ReplyAttr, ReplyWrite};
 use std::time::Instant;
 use std::time::Duration;
-
-use nix::sys::signal;
 
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::sync::Arc;
@@ -96,7 +94,7 @@ impl WritebackThread {
                     let p = g.queue.pop().unwrap();
                     let data = g.cache.remove(&p.block_index).expect("inconsistency detected");
                     writeback = Some((SeekFrom::Start(blocksize * p.block_index), data));
-                    break; // release lock and go to outer loop
+                    break 'inner; // release lock and go to outer loop
                 } 
             
                 if let Some(ttw) = timetowait {
@@ -143,9 +141,12 @@ impl WritebackThread {
         self.attention.notify_all();
     }
     
-    fn stop(&self) {
+    fn stop(&self) -> usize {
         *self.please_stop.lock().unwrap() = true;
         self.attention.notify_all();
+        let mut g = self.s.lock().unwrap();
+        g.cache.len()
+        
     }
 }
 
@@ -190,18 +191,79 @@ fn test_writeback_thread() {
     
     ::std::thread::sleep(Duration::from_secs(2));
     
-    wt.stop();
+    assert_eq!(wt.stop(), 2);
     
     let r = waiter.join().unwrap();
     assert_eq!(r.get_ref(), &vec![0,0,5,1,2,1,0,0,7,3]);
 }
+////////////////////////////////////////////////////
 
+const TTL: Timespec = Timespec { sec: 10, nsec: 0 };
+const CREATE_TIME: Timespec = Timespec { sec: 1458180306, nsec: 0 }; //FIXME
 
+const HELLO_TXT_CONTENT: &'static str = "Hello World!\n";
 
-extern fn handle_sigint(_:i32) {
-    let outstanding_blocks = 0;
-    println!("Throwing away {} dirty blocks.", outstanding_blocks);
-    ::std::process::exit(0);
+struct BunchOfTraitsAsFs<'a, F : Read + Write + Seek + 'a> {
+    file: &'a mut F,
+    fa: FileAttr,
+}
+
+impl<'a, F> BunchOfTraitsAsFs<'a, F> where F : Read + Write + Seek {
+    fn new(f: &'a mut F, bs: u64) -> BunchOfTraitsAsFs<F> {
+        let len = f.seek(SeekFrom::End(0)).expect("File not seekable");
+        let blocks = ((len-1) / bs) + 1;
+    
+        BunchOfTraitsAsFs { 
+            file: f,
+            fa: FileAttr {
+                ino: 1,
+                size: len,
+                blocks: blocks,
+                atime: CREATE_TIME,
+                mtime: CREATE_TIME,
+                ctime: CREATE_TIME,
+                crtime: CREATE_TIME,
+                kind: FileType::RegularFile,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                flags: 0,
+            }
+        }
+    }
+}
+
+const ENOENT : i32 = 2;
+
+impl<'a, F> Filesystem for BunchOfTraitsAsFs<'a, F>  where F : Read + Write + Seek {
+    fn lookup (&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
+        reply.entry(&TTL, &self.fa, 0);
+    }
+
+    fn getattr (&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        reply.attr(&TTL, &self.fa);
+    }
+
+    fn read (&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, _size: u32, reply: ReplyData) {
+        self.file.seek(SeekFrom::Start(offset)).unwrap();
+        
+        let mut buf = vec![0; _size as usize];
+        let ret = self.file.read(&mut buf).unwrap();
+        buf.truncate(ret);
+        
+        reply.data(buf.as_slice());
+    }
+    
+    fn write (&mut self, _req: &Request, _ino: u64, _fh: u64, _offset: u64, _data: &[u8], _flags: u32, reply: ReplyWrite) {
+        self.file.seek(SeekFrom::Start(_offset)).unwrap();
+        
+        self.file.write_all(_data).unwrap();
+        //self.file.flush().unwrap();
+        
+        reply.written(_data.len() as u32);
+    }
 }
 
 fn main () {
@@ -229,20 +291,53 @@ fn main () {
         
         ::std::process::exit(1);
     }
-    let source_file     = env::args_os().nth(1).unwrap();
-    let mountpoint_file = env::args_os().nth(2).unwrap();
-    let blocksize       = env::args_os().nth(3).unwrap();
-    let maxtime         = env::args_os().nth(4).unwrap();
-    let maxblocks       = env::args_os().nth(5).unwrap();
-    //fuse::mount(OutoforderFs, &mountpoint, &[]);
+    let source_file_s     = env::args_os().nth(1).unwrap();
+    let mountpoint_file_s = env::args_os().nth(2).unwrap();
+    let blocksize_s       = env::args_os().nth(3).unwrap();
+    let maxtime_s         = env::args_os().nth(4).unwrap();
+    let maxblocks_s       = env::args_os().nth(5).unwrap();
+
+    let mut source_file = ::std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .truncate(false)
+                        .create(false)
+                        .open(&source_file_s)
+                        .expect("Can't open source file");
+    // FIXME :
+    let mut source_file_2 = ::std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .truncate(false)
+                        .create(false)
+                        .open(&source_file_s)
+                        .expect("Can't open source file");
+                        
+    let blocksize : u64 = blocksize_s.to_str().unwrap().parse().unwrap();
+    let maxtime   : u64 = maxtime_s.to_str().unwrap().parse().unwrap();
+    let maxblocks : u64 = maxblocks_s.to_str().unwrap().parse().unwrap();
+                        
     
+    let mut wt = Arc::new(WritebackThread::new());
     
-    let sig_action = signal::SigAction::new(handle_sigint,
-                                          signal::SockFlag::empty(),
-                                          signal::SigSet::empty());
-    unsafe { signal::sigaction(signal::SIGINT, &sig_action).unwrap(); }
+    use chan_signal::Signal;
+    let signal = chan_signal::notify(&[Signal::INT, Signal::TERM]);
     
-    //let sf = 
+    let waiter = {
+        let mut wt2 = wt.clone();
+        ::std::thread::spawn(move || {
+            wt2.run(&mut source_file, blocksize);
+        })
+    };
     
-    ::std::thread::sleep(Duration::from_secs(1));
+    let fs = BunchOfTraitsAsFs::new(&mut source_file_2, blocksize);
+    let guard = unsafe { fuse::spawn_mount(fs, &mountpoint_file_s, &[]) };
+    
+    signal.recv().unwrap();
+    
+    let outstanding_blocks = wt.stop();
+    println!("");
+    println!("{} dirty blocks lost", outstanding_blocks);
+    
+    waiter.join().unwrap();
 }
