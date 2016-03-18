@@ -245,9 +245,35 @@ fn test_writeback_thread() {
 }
 
 impl<'a, F> Read for VirtualFile<'a, F> where F : LikeFile + 'a {
-    fn read(&mut self, b: &mut [u8]) -> Result<usize,::std::io::Error> {
-        let mut file = self.w.f.lock().unwrap();
-        file.read(b)
+    fn read(&mut self, mut b: &mut [u8]) -> Result<usize,::std::io::Error> {
+        
+        enum O {
+            ReadFromFile,
+            ReadFromCache,
+        }
+        
+        let bs = self.w.blocksize;
+        
+        let current_block = self.cursor / bs;
+        
+        if self.w.checkblock(current_block) {
+            // read from cache
+            unimplemented!()
+        } else {
+            // read from file
+            
+            let beginning_of_the_next_block = (current_block+1) * bs;
+            let distance_to_the_end_of_block = (beginning_of_the_next_block - self.cursor) as usize;
+            
+            // limit reading to be within one block
+            if b.len() > distance_to_the_end_of_block {
+                let mut tmp = b;
+                b = &mut tmp[..distance_to_the_end_of_block] 
+            };
+            
+            let mut file = self.w.f.lock().unwrap();
+            file.read(b)
+        }
     }
 }
 
@@ -265,7 +291,7 @@ impl<'a, F> Write for VirtualFile<'a, F> where F : LikeFile + 'a {
 impl<'a, F> Seek for VirtualFile<'a, F> where F : LikeFile + 'a {
     fn seek(&mut self, s: ::std::io::SeekFrom) -> Result<u64,::std::io::Error> {
         let mut file = self.w.f.lock().unwrap();
-        file.seek(s)
+        file.seek(s).map(|x| {self.cursor = x; x})
     }
 }
 
@@ -291,35 +317,35 @@ fn virtual_file_consistency() {
     assert_eq!(vf.write(&vec![4]  ).unwrap(), 1);
     assert_eq!(vf.write(&vec![5,8]).unwrap(), 2);
     assert_eq!(vf.write(&vec![1,3,9]).unwrap(), 3);
-    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+    assert_eq!(vf.read_exact2(&mut buf3).unwrap(), 3); 
         assert_eq!(&[0,0,0], &buf3);
     
     assert_eq!(vf.seek(SeekFrom::Start(0)).unwrap(), 0);
-    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+    assert_eq!(vf.read_exact2(&mut buf3).unwrap(), 3); 
         assert_eq!(&[4,5,8], &buf3);
-    assert_eq!(vf.read(&mut buf2).unwrap(), 2); 
+    assert_eq!(vf.read_exact2(&mut buf2).unwrap(), 2); 
         assert_eq!(&[1,3], &buf2);
-    assert_eq!(vf.read(&mut buf1).unwrap(), 1); 
+    assert_eq!(vf.read_exact2(&mut buf1).unwrap(), 1); 
         assert_eq!(&[9], &buf1);
     
     ::std::thread::sleep(Duration::from_secs(1));
     
     assert_eq!(vf.seek(SeekFrom::Start(0)).unwrap(), 0);
-    assert_eq!(vf.read(&mut buf2).unwrap(), 2); 
+    assert_eq!(vf.read_exact2(&mut buf2).unwrap(), 2); 
         assert_eq!(&[4,5], &buf2);
-    assert_eq!(vf.read(&mut buf1).unwrap(), 1); 
+    assert_eq!(vf.read_exact2(&mut buf1).unwrap(), 1); 
         assert_eq!(&[8], &buf1);
-    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+    assert_eq!(vf.read_exact2(&mut buf3).unwrap(), 3); 
         assert_eq!(&[1,3,9], &buf3);
         
     ::std::thread::sleep(Duration::from_secs(2));
     
     assert_eq!(vf.seek(SeekFrom::Start(0)).unwrap(), 0);
-    assert_eq!(vf.read(&mut buf1).unwrap(), 1); 
+    assert_eq!(vf.read_exact2(&mut buf1).unwrap(), 1); 
         assert_eq!(&[4], &buf1);
-    assert_eq!(vf.read(&mut buf2).unwrap(), 2); 
+    assert_eq!(vf.read_exact2(&mut buf2).unwrap(), 2); 
         assert_eq!(&[5,8], &buf2);
-    assert_eq!(vf.read(&mut buf3).unwrap(), 3); 
+    assert_eq!(vf.read_exact2(&mut buf3).unwrap(), 3); 
         assert_eq!(&[1,3,9], &buf3);
     
     wt.stop();
