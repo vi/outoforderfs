@@ -316,13 +316,13 @@ const CREATE_TIME: Timespec = Timespec { sec: 1458180306, nsec: 0 }; //FIXME
 
 const HELLO_TXT_CONTENT: &'static str = "Hello World!\n";
 
-struct BunchOfTraitsAsFs<'a, F : LikeFile + 'a> {
-    file: &'a mut F,
+struct BunchOfTraitsAsFs<F : LikeFile> {
+    file: F,
     fa: FileAttr,
 }
 
-impl<'a, F> BunchOfTraitsAsFs<'a, F> where F : LikeFile {
-    fn new(f: &'a mut F, bs: u64) -> BunchOfTraitsAsFs<F> {
+impl<F> BunchOfTraitsAsFs<F> where F : LikeFile {
+    fn new(mut f: F, bs: u64) -> BunchOfTraitsAsFs<F> {
         let len = f.seek(SeekFrom::End(0)).expect("File not seekable");
         let blocks = ((len-1) / bs) + 1;
     
@@ -349,7 +349,7 @@ impl<'a, F> BunchOfTraitsAsFs<'a, F> where F : LikeFile {
 }
 const ENOENT : i32 = 2;
 
-impl<'a, F> Filesystem for BunchOfTraitsAsFs<'a, F>  where F : LikeFile {
+impl<F> Filesystem for BunchOfTraitsAsFs<F>  where F : LikeFile {
     fn lookup (&mut self, _req: &Request, parent: u64, name: &Path, reply: ReplyEntry) {
         reply.entry(&TTL, &self.fa, 0);
     }
