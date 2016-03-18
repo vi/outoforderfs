@@ -32,6 +32,23 @@ struct DelayedWriteback {
     block_index : BlockIndex,
 }
 
+trait MyReadEx : Read {
+    // Based on https://doc.rust-lang.org/src/std/io/mod.rs.html#620
+    fn read_exact2(&mut self, mut buf: &mut [u8]) -> ::std::io::Result<usize> {
+        let mut successfully_read = 0;
+        while !buf.is_empty() {
+            match self.read(buf) {
+                Ok(0) => break,
+                Ok(n) => { successfully_read+=n; let tmp = buf; buf = &mut tmp[n..]; }
+                Err(ref e) if e.kind() == ::std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(successfully_read)
+    }
+}
+impl<T:Read> MyReadEx for T{}
+
 type BlockCache = std::collections::BTreeMap<BlockIndex, Vec<u8>>;
 type Queue = std::collections::BinaryHeap<DelayedWriteback>;
 
@@ -362,7 +379,7 @@ impl<F> Filesystem for BunchOfTraitsAsFs<F>  where F : LikeFile {
         self.file.seek(SeekFrom::Start(offset)).unwrap();
         
         let mut buf = vec![0; _size as usize];
-        let ret = self.file.read(&mut buf).unwrap();
+        let ret = self.file.read_exact2(&mut buf).unwrap();
         buf.truncate(ret);
         
         reply.data(buf.as_slice());
