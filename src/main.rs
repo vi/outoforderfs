@@ -485,6 +485,7 @@ fn main () {
     
     let mut wt = Arc::new(WritebackThread::new(source_file, blocksize));
     let wt2 = wt.clone();
+    let wt3 = wt.clone();
     
     use chan_signal::Signal;
     let signal = chan_signal::notify(&[Signal::INT, Signal::TERM]);
@@ -495,10 +496,11 @@ fn main () {
         })
     };
     
-    let mut vf = wt.get_virtual_file(maxblocks, Duration::from_millis(0), Duration::from_millis(maxtime));
-    
-    let fs = BunchOfTraitsAsFs::new(&mut vf, blocksize);
-    let guard = unsafe { fuse::spawn_mount(fs, &mountpoint_file_s, &[]) };
+    ::std::thread::spawn(move || {
+        let mut vf = wt3.get_virtual_file(maxblocks, Duration::from_millis(0), Duration::from_millis(maxtime));
+        let fs = BunchOfTraitsAsFs::new(&mut vf, blocksize);
+        fuse::mount(fs, &mountpoint_file_s, &[])
+    });
     
     signal.recv().unwrap();
     
