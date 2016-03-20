@@ -64,20 +64,20 @@ struct WritebackThread<F : LikeFile> {
     writeback_completed: Condvar,
     please_stop: Mutex<bool>,
     f: Mutex<F>,
-    blocksize: u64,
+    blocksize: usize,
     
 }
 
 struct VirtualFile<'a, F: LikeFile + 'a> {
     cursor: u64,
-    maxdirtyblocks: u64,
+    maxdirtyblocks: usize,
     mindelay: Duration,
     maxdelay: Duration,
     w: &'a WritebackThread<F>,
 }
 
 impl<F> WritebackThread<F> where F : LikeFile {
-    fn new(file: F, blocksize: u64) -> WritebackThread<F> { 
+    fn new(file: F, blocksize: usize) -> WritebackThread<F> { 
         WritebackThread {
             s: Mutex::new(Default::default()),
             attention: Condvar::new(),
@@ -90,7 +90,7 @@ impl<F> WritebackThread<F> where F : LikeFile {
     
     fn into_file(self) -> F { self.f.into_inner().unwrap() }
     
-    fn get_virtual_file<'a>(&'a self, maxdirtyblocks: u64, mindelay: Duration, maxdelay: Duration) -> VirtualFile<'a, F> {
+    fn get_virtual_file<'a>(&'a self, maxdirtyblocks: usize, mindelay: Duration, maxdelay: Duration) -> VirtualFile<'a, F> {
         VirtualFile {
             cursor: 0,
             maxdirtyblocks: maxdirtyblocks,
@@ -140,7 +140,7 @@ impl<F> WritebackThread<F> where F : LikeFile {
                 if needwriteback {
                     let p = g.queue.pop().unwrap();
                     let data = g.cache.remove(&p.block_index).expect("inconsistency detected");
-                    writeback = Some((SeekFrom::Start(self.blocksize * p.block_index), data));
+                    writeback = Some((SeekFrom::Start((self.blocksize as u64) * p.block_index), data));
                     break 'inner; // release lock and go to outer loop
                 } 
             
@@ -159,9 +159,9 @@ impl<F> WritebackThread<F> where F : LikeFile {
         return g.cache.contains_key(&bi);
     }
     
-    fn useblock<G>(&self, bi: BlockIndex, closure: G) where G: FnOnce(Option<&Vec<u8>>) {
+    fn useblock<G,R>(&self, bi: BlockIndex, closure: G) -> R where G: FnOnce(Option<&Vec<u8>>) -> R {
         let mut g = self.s.lock().unwrap();
-        closure(g.cache.get(&bi));
+        closure(g.cache.get(&bi))
     }
     
     fn writeblock(&self, bi: BlockIndex, data: Vec<u8>, maxblocks: usize, mindelay: Duration, maxdelay: Duration) {
@@ -246,44 +246,61 @@ fn test_writeback_thread() {
 
 impl<'a, F> Read for VirtualFile<'a, F> where F : LikeFile + 'a {
     fn read(&mut self, mut b: &mut [u8]) -> Result<usize,::std::io::Error> {
-        
-        enum O {
-            ReadFromFile,
-            ReadFromCache,
-        }
-        
+        let cursor = self.cursor;
         let bs = self.w.blocksize;
+        let current_block = self.cursor / (bs as u64);
+        let position_within_block = (cursor - current_block * (bs as u64)) as usize;
         
-        let current_block = self.cursor / bs;
+        // Don't let read request span more than one block
+        if b.len() > bs - position_within_block {
+            let mut tmp = b;
+            b = &mut tmp[..(bs - position_within_block)] 
+        };
         
-        if self.w.checkblock(current_block) {
-            // read from cache
-            unimplemented!()
-        } else {
-            // read from file
+        self.w.useblock(current_block, |bl| {
+            if let Some(x) = bl {
             
-            let beginning_of_the_next_block = (current_block+1) * bs;
-            let distance_to_the_end_of_block = (beginning_of_the_next_block - self.cursor) as usize;
-            
-            // limit reading to be within one block
-            if b.len() > distance_to_the_end_of_block {
-                let mut tmp = b;
-                b = &mut tmp[..distance_to_the_end_of_block] 
-            };
-            
-            let mut file = self.w.f.lock().unwrap();
-            file.read(b)
-        }
+                let blen = b.len();
+                b.clone_from_slice(&x[position_within_block..(position_within_block+blen)]);
+                self.seek(SeekFrom::Start(cursor + (blen as u64))).unwrap();
+                Ok(blen)
+            } else {
+                // read from file
+                
+                let mut file = self.w.f.lock().unwrap();
+                file.read(b).map(|x|{self.cursor+=x as u64; x})
+            }
+        })
     }
 }
 
 impl<'a, F> Write for VirtualFile<'a, F> where F : LikeFile + 'a {
-    fn write(&mut self, b: &[u8]) -> Result<usize,::std::io::Error> {
-        let mut file = self.w.f.lock().unwrap();
-        file.write(b)
+    fn write(&mut self, mut b: &[u8]) -> Result<usize,::std::io::Error> {
+        
+        let cursor = self.cursor;
+        let bs = self.w.blocksize;
+        let current_block = cursor / (bs as u64);
+        let position_within_block = (cursor - current_block * (bs as u64)) as usize;
+        
+        let mut block_to_be_written = vec![0; bs];
+        
+        if b.len() + position_within_block > bs  { let mut tmp = b; b = &tmp[..(bs-position_within_block)]; }
+        
+        if b.len() < bs || position_within_block > 0 {
+            self.seek(SeekFrom::Start(current_block * (bs as u64))).unwrap();
+            self.read_exact(&mut block_to_be_written[..]).unwrap();
+        }
+        block_to_be_written[position_within_block..(position_within_block+b.len())].clone_from_slice(b); // copy_from_slice?
+        
+        self.w.writeblock(current_block, block_to_be_written, self.maxdirtyblocks, self.mindelay, self.maxdelay);
+        
+        self.seek(SeekFrom::Start(cursor + (b.len() as u64))).unwrap();
+        
+        Ok(b.len())
     }
     
     fn flush(&mut self) -> Result<(), ::std::io::Error> {
+        // Explicitly ignored
         Ok(())
     }
 }
@@ -291,6 +308,7 @@ impl<'a, F> Write for VirtualFile<'a, F> where F : LikeFile + 'a {
 impl<'a, F> Seek for VirtualFile<'a, F> where F : LikeFile + 'a {
     fn seek(&mut self, s: ::std::io::SeekFrom) -> Result<u64,::std::io::Error> {
         let mut file = self.w.f.lock().unwrap();
+        // TODO use cursor as base, not current file's value
         file.seek(s).map(|x| {self.cursor = x; x})
     }
 }
@@ -314,9 +332,9 @@ fn virtual_file_consistency() {
     let mut buf3 = [0; 3];
     
     let mut vf = wt.get_virtual_file(10, Duration::from_secs(0), Duration::from_secs(2));
-    assert_eq!(vf.write(&vec![4]  ).unwrap(), 1);
-    assert_eq!(vf.write(&vec![5,8]).unwrap(), 2);
-    assert_eq!(vf.write(&vec![1,3,9]).unwrap(), 3);
+    vf.write_all(&vec![4]  ).unwrap();
+    vf.write_all(&vec![5,8]).unwrap();
+    vf.write_all(&vec![1,3,9]).unwrap();
     assert_eq!(vf.read_exact2(&mut buf3).unwrap(), 3); 
         assert_eq!(&[0,0,0], &buf3);
     
@@ -365,9 +383,9 @@ struct BunchOfTraitsAsFs<F : LikeFile> {
 }
 
 impl<F> BunchOfTraitsAsFs<F> where F : LikeFile {
-    fn new(mut f: F, bs: u64) -> BunchOfTraitsAsFs<F> {
+    fn new(mut f: F, bs: usize) -> BunchOfTraitsAsFs<F> {
         let len = f.seek(SeekFrom::End(0)).expect("File not seekable");
-        let blocks = ((len-1) / bs) + 1;
+        let blocks = ((len-1) / (bs as u64)) + 1;
     
         BunchOfTraitsAsFs { 
             file: f,
@@ -460,9 +478,9 @@ fn main () {
                         .open(&source_file_s)
                         .expect("Can't open source file");
                         
-    let blocksize : u64 = blocksize_s.to_str().unwrap().parse().unwrap();
-    let maxtime   : u64 = maxtime_s.to_str().unwrap().parse().unwrap();
-    let maxblocks : u64 = maxblocks_s.to_str().unwrap().parse().unwrap();
+    let blocksize : usize = blocksize_s.to_str().unwrap().parse().unwrap();
+    let maxtime   : u64   =   maxtime_s.to_str().unwrap().parse().unwrap();
+    let maxblocks : usize = maxblocks_s.to_str().unwrap().parse().unwrap();
                         
     
     let mut wt = Arc::new(WritebackThread::new(source_file, blocksize));
