@@ -263,11 +263,13 @@ impl<'a, F> Read for VirtualFile<'a, F> where F : LikeFile + 'a {
                 let blen = b.len();
                 b.clone_from_slice(&x[position_within_block..(position_within_block+blen)]);
                 self.seek(SeekFrom::Start(cursor + (blen as u64))).unwrap();
+                // cursor gets shifted automatically
                 Ok(blen)
             } else {
                 // read from file
                 
                 let mut file = self.w.f.lock().unwrap();
+                file.seek(SeekFrom::Start(self.cursor)).unwrap();
                 file.read(b).map(|x|{self.cursor+=x as u64; x})
             }
         })
@@ -295,6 +297,7 @@ impl<'a, F> Write for VirtualFile<'a, F> where F : LikeFile + 'a {
         self.w.writeblock(current_block, block_to_be_written, self.maxdirtyblocks, self.mindelay, self.maxdelay);
         
         self.seek(SeekFrom::Start(cursor + (b.len() as u64))).unwrap();
+        // cursor gets shifted automatically
         
         Ok(b.len())
     }
@@ -378,7 +381,7 @@ const CREATE_TIME: Timespec = Timespec { sec: 1458180306, nsec: 0 }; //FIXME
 const HELLO_TXT_CONTENT: &'static str = "Hello World!\n";
 
 struct BunchOfTraitsAsFs<F : LikeFile> {
-    file: F,
+    file: Mutex<F>,
     fa: FileAttr,
 }
 
@@ -388,7 +391,7 @@ impl<F> BunchOfTraitsAsFs<F> where F : LikeFile {
         let blocks = ((len-1) / (bs as u64)) + 1;
     
         BunchOfTraitsAsFs { 
-            file: f,
+            file: Mutex::new(f),
             fa: FileAttr {
                 ino: 1,
                 size: len,
@@ -420,20 +423,22 @@ impl<F> Filesystem for BunchOfTraitsAsFs<F>  where F : LikeFile {
     }
 
     fn read (&mut self, _req: &Request, ino: u64, _fh: u64, offset: u64, _size: u32, reply: ReplyData) {
-        self.file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
         
         let mut buf = vec![0; _size as usize];
-        let ret = self.file.read_exact2(&mut buf).unwrap();
+        let ret = file.read_exact2(&mut buf).unwrap();
         buf.truncate(ret);
         
         reply.data(buf.as_slice());
     }
     
     fn write (&mut self, _req: &Request, _ino: u64, _fh: u64, _offset: u64, _data: &[u8], _flags: u32, reply: ReplyWrite) {
-        self.file.seek(SeekFrom::Start(_offset)).unwrap();
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(_offset)).unwrap();
         
-        self.file.write_all(_data).unwrap();
-        //self.file.flush().unwrap();
+        file.write_all(_data).unwrap();
+        //file.flush().unwrap();
         
         reply.written(_data.len() as u32);
     }
